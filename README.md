@@ -73,16 +73,6 @@ CREATE INDEX messages_room_id_id_idx
 ON messages (room_id, id);
 ```
 
-Если таблица `messages` уже была создана, проверь `room_id` и индекс:
-
-```sql
-ALTER TABLE messages
-ALTER COLUMN room_id SET NOT NULL;
-
-CREATE INDEX IF NOT EXISTS messages_room_id_id_idx
-ON messages (room_id, id);
-```
-
 ## Запуск
 
 Не добавляй пароль PostgreSQL прямо в исходный код. Сервер читает строку подключения из переменной окружения `DATABASE_URL`.
