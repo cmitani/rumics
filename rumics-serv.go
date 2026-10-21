@@ -68,7 +68,7 @@ func createHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, c
 	}
 
 	_, err = pool.Exec(ctx,
-		"INSERT INTO rooms1 (id, expire, salt) VALUES ($1, $2, $3)",
+		"INSERT INTO rooms (id, expire, salt) VALUES ($1, $2, $3)",
 		roomID, expireDate, salt,
 	)
 	if err != nil {
@@ -105,7 +105,7 @@ func connectHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, 
 	var iv []byte
 
 	err := pool.QueryRow(ctx,
-		"SELECT salt, key, IV FROM rooms1 WHERE id = $1",
+		"SELECT salt, key, IV FROM rooms WHERE id = $1",
 		roomID,
 	).Scan(&salt, &encryptedRoomKey, &iv)
 	if err != nil {
@@ -146,7 +146,7 @@ func storeRoomKeyHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.P
 	}
 
 	result, err := pool.Exec(ctx,
-		"UPDATE rooms1 SET key = $1, IV = $2 WHERE id = $3",
+		"UPDATE rooms SET key = $1, IV = $2 WHERE id = $3",
 		encryptedRoomKey, iv, roomID,
 	)
 	if err != nil {
@@ -276,7 +276,7 @@ func checker(pool *pgxpool.Pool, ctx context.Context) {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		_, err := pool.Exec(ctx, "DELETE FROM rooms1 WHERE expire <= now()")
+		_, err := pool.Exec(ctx, "DELETE FROM rooms WHERE expire <= now()")
 		if err != nil {
 			log.Print(err)
 		}
