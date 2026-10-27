@@ -3,6 +3,9 @@
 !.env.example
 *.exe
 *.log
+scripts/dumps/
+scripts/logs/
 .idea/
 .vscode/
+.mimosa
 
