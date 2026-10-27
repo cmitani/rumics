@@ -48,30 +48,25 @@ Browser B <── decrypt ─── ciphertext + IV
 - браузер с поддержкой Web Crypto API;
 - доступ к CDN для загрузки `hash-wasm`.
 
-## Настройка PostgreSQL
+## Миграции базы данных
 
-Для текущего MVP таблицы создаются вручную через SQL-клиент:
+Схема базы описана миграциями в каталоге `migrations/` (SQL-файлы формата golang-migrate) и применяется утилитой `migrations/migrate.go`. Задай `DATABASE_URL` и запусти утилиту из корня проекта:
 
-```sql
-CREATE TABLE rooms1 (
-    id TEXT PRIMARY KEY,
-    expire TIMESTAMPTZ NOT NULL,
-    salt BYTEA NOT NULL,
-    key BYTEA,
-    iv BYTEA
-);
+PowerShell:
 
-CREATE TABLE messages (
-    id BIGSERIAL PRIMARY KEY,
-    room_id TEXT NOT NULL REFERENCES rooms1(id) ON DELETE CASCADE,
-    ciphertext BYTEA NOT NULL,
-    iv BYTEA NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX messages_room_id_id_idx
-ON messages (room_id, id);
+```powershell
+$env:DATABASE_URL = "postgres://username:password@localhost:5432/rumics_db"
+go run ./migrations
 ```
+
+Bash (Linux/macOS):
+
+```bash
+export DATABASE_URL="postgres://username:password@localhost:5432/rumics_db"
+go run ./migrations
+```
+
+Утилита применяет все неприменённые миграции (`*.up.sql`). Если схема уже актуальна, команда завершается без изменений.
 
 ## Запуск
 
@@ -95,6 +90,40 @@ http://localhost:8080
 ```powershell
 go test ./...
 ```
+
+## Бэкапы и восстановление
+
+`scripts/backup.sh` делает дамп PostgreSQL через `pg_dump -Fc` в `scripts/dumps/`, пишет лог в `scripts/logs/backup.log` и удаляет дампы старше семи дней. `DATABASE_URL` скрипт берёт из окружения или из `.env` в корне проекта; требуются установленные `psql` и `pg_dump`.
+
+`scripts/restore.sh ПУТЬ_К_ДАМПУ` восстанавливает базу из дампа. Рестор всегда выполняется вручную и только в пустую базу: если в целевой БД уже есть пользовательские таблицы, скрипт откажется работать, чтобы не затереть данные.
+
+### Автоматический бэкап через systemd (Linux)
+
+Юниты в `systemd/` запускают бэкап раз в сутки по таймеру; восстановление таймером не автоматизируется — только `restore.sh` вручную.
+
+1. Скопируй юниты на сервер и поправь путь к проекту (в юните по умолчанию `/opt/rumics`):
+
+```bash
+sudo cp systemd/back-up.service systemd/back-up.timer /etc/systemd/system/
+sudo sed -i 's|/opt/rumics|/путь/к/проекту|g' /etc/systemd/system/back-up.service
+chmod +x scripts/backup.sh
+```
+
+2. Включи таймер:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now back-up.timer
+```
+
+3. Проверь работу:
+
+```bash
+systemctl list-timers back-up.timer        # расписание следующего запуска
+sudo systemctl start back-up.service       # разовый бэкап без ожидания таймера
+```
+
+Таймер срабатывает каждый день в 03:00 по местному времени (`OnCalendar`). Если сервер был выключен в этот момент, бэкап выполнится после включения (`Persistent=true`).
 
 ## Проверка двумя пользователями
 
@@ -125,8 +154,7 @@ go test ./...
 3. Заменить polling на WebSocket-архитектуру для доставки сообщений в реальном времени.
 4. Добавить обработку небольших файлов, включая изображения, видео и аудио, с отображением файлов внутри чата.
 5. Исследовать поддержку комнат более чем на двух пользователей. Для этого потребуется понятная схема идентификации участников в интерфейсе без аккаунтов.
-6. Добавить нормальную систему миграций PostgreSQL с последовательными SQL-файлами и историей изменений схемы.
-7. Перейти с HTTP на HTTPS и настроить TLS для безопасной передачи данных между браузером и сервером.
+6. Перейти с HTTP на HTTPS и настроить TLS для безопасной передачи данных между браузером и сервером.
 
 ## Ограничения текущего MVP
 
@@ -139,7 +167,7 @@ go test ./...
 
 ## Файлы проекта
 
-В текущем MVP используются `rumics-serv.go`, `index.html`, `go.mod` и `go.sum`. Файл `.env.example` используется как пример настройки подключения.
+В текущем MVP используются `rumics-serv.go`, `index.html`, `go.mod` и `go.sum`. Схема базы данных описана в `migrations/`, скрипты бэкапа и восстановления лежат в `scripts/`, systemd-юниты для ежедневного бэкапа — в `systemd/`. Файл `.env.example` используется как пример настройки подключения.
 
 ## Лицензия
 

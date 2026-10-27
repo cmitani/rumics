@@ -5,4 +5,10 @@
 *.log
 .idea/
 .vscode/
+scripts/dumps/
+scripts/logs/
+.idea/
+.vscode/
+.mimosa
+
 

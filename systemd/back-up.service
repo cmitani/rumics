@@ -1,0 +1,19 @@
+[Unit]
+Description=Rumics: резервное копирование PostgreSQL (pg_dump)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Замени /opt/rumics на фактический путь к проекту на сервере.
+# DATABASE_URL скрипт читает из окружения либо из /opt/rumics/.env.
+ExecStart=/opt/rumics/scripts/backup.sh
+
+# Бэкап — фоновая задача: снижаем приоритет CPU и дискового ввода-вывода.
+Nice=10
+IOSchedulingClass=idle
+
+# Можно запускать от отдельного пользователя, которому доступны
+# каталог проекта (включая .env) и postgres-клиенты:
+# User=rumics
+# Group=rumics
