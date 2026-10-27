@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rumics</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: Arial, sans-serif;
+      background: #101116;
+      color: #f4f4f5;
+    }
+    main { width: min(100% - 32px, 760px); }
+    h1 { margin: 0 0 8px; font-size: 2.4rem; }
+    .subtitle { margin: 0 0 28px; color: #a3a3ad; }
+    .panel {
+      padding: 24px;
+      border: 1px solid #2a2c36;
+      border-radius: 16px;
+      background: #191a21;
+    }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    button, input { width: 100%; border-radius: 9px; font: inherit; }
+    button { padding: 13px; border: 0; cursor: pointer; font-weight: 700; }
+    .create { background: #7c5cff; color: white; }
+    .connect { background: #2a2c36; color: white; }
+    form { display: none; margin-top: 22px; }
+    form.active { display: grid; gap: 12px; }
+    label { display: grid; gap: 6px; font-size: .9rem; color: #c4c4cd; }
+    input { padding: 12px; border: 1px solid #3a3c48; background: #101116; color: white; }
+    .submit { background: #e9e9ee; color: #15151a; }
+    .hint { margin: 2px 0 0; font-size: .8rem; color: #8f909b; }
+    [hidden] { display: none !important; }
+    .room-panel {
+      min-height: 520px;
+      display: flex;
+      flex-direction: column;
+    }
+    .messages {
+      flex: 1;
+      min-height: 360px;
+      padding: 16px;
+      border: 1px solid #2a2c36;
+      border-radius: 10px;
+      color: #8f909b;
+      background: #101116;
+    }
+    .composer { display: flex; gap: 10px; margin-top: 16px; }
+    .composer input { flex: 1; min-width: 0; }
+    .composer button { width: auto; padding-inline: 20px; background: #7c5cff; color: white; }
+  </style>
+</head>
+<body>
+  <main>
+    <div id="home-view">
+    <h1>Rumics</h1>
+    <p class="subtitle">Создай приватную комнату или войди в существующую.</p>
+
+    <section class="panel">
+      <div class="actions">
+        <button class="create" type="button" data-open="create-form">Create room</button>
+        <button class="connect" type="button" data-open="connect-form">Connect</button>
+      </div>
+
+      
+      <form id="create-form" action="/create" method="post">
+        <label>
+          Время жизни(часы)
+          <input name="expire" type="number" min="1" required autocomplete="off">
+        </label>
+        <label>
+          Пароль комнаты
+          <input name="password" type="password" minlength="8" required autocomplete="new-password">
+        </label>
+        <label>
+          Повтори пароль
+          <input id ="pass_conf" name="password_confirmation" type="password" minlength="8" required autocomplete="new-password">
+        </label>
+        <button class="submit" type="submit">Создать</button>
+        <p class="hint">После создания сервер перенаправит тебя на ссылку комнаты.</p>
+      </form>
+
+      <form id="connect-form" action="/connect" method="post">
+        <label>
+          ID или ссылка комнаты
+          <input name="room_id" type="text" required placeholder="Например: a1b2c3d4..." autocomplete="off">
+        </label>
+        <label>
+          Пароль комнаты
+          <input name="password" type="password" required autocomplete="current-password">
+        </label>
+        <button class="submit" type="submit">Войти в комнату</button>
+      </form>
+    </section>
+    </div>
+
+    <div id="room-view" hidden>
+      <h1>Rumics room</h1>
+      <p class="subtitle">Room ID: <span id="room-id">{{ .RoomID }}</span></p>
+
+      <section class="panel room-panel">
+        <div id="messages" class="messages">
+          Сообщений пока нет.
+        </div>
+
+        <form id="message-form" class="composer" action="/room/send" method="post">
+          <input type="hidden" name="room_id" value="{{ .RoomID }}">
+          <input
+            id="message-input"
+            name="message"
+            type="text"
+            placeholder="Напиши сообщение..."
+            autocomplete="off"
+            required
+          >
+          <button type="submit">Отправить</button>
+        </form>
+      </section>
+    </div>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/hash-wasm@4"></script>
+  <script>
+
+    const accessForms = document.querySelectorAll('#create-form, #connect-form');
+    const homeView = document.getElementById('home-view');
+    const roomView = document.getElementById('room-view');
+    const roomIdElement = document.getElementById('room-id');
+    const roomIdInput = document.querySelector('#message-form input[name="room_id"]');
+    const messageForm = document.getElementById('message-form');
+    const messageInput = document.getElementById('message-input');
+    const messagesElement = document.getElementById('messages');
+    let lastMessageID = 0;
+    let pollingTimer = null;
+    let pollingInProgress = false;
+
+    document.querySelectorAll('[data-open]').forEach((button) => {
+      button.addEventListener('click', () => {
+        accessForms.forEach((form) => {
+          form.classList.toggle('active', form.id === button.dataset.open);
+        });
+      });
+    });
+
+    function base64ToBytes(value) {
+
+      const binary = atob(value);
+      return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    }
+
+    function hexToBytes(hex) {
+
+      const bytes = new Uint8Array(hex.length / 2);
+      for (let index = 0; index < bytes.length; index += 1) {
+        bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+      }
+      return bytes;
+    }
+
+    function bytesToBase64(bytes) {
+
+      let binary = '';
+      bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+      return btoa(binary);
+    }
+
+    function normalizeRoomID(value) {
+      const input = value.trim();
+      try {
+        const url = new URL(input, window.location.origin);
+        if (url.origin === window.location.origin) {
+          return url.pathname.replace(/^\/+|\/+$/g, '');
+        }
+      } catch (error) {
+        return input.replace(/^\/+|\/+$/g, '');
+      }
+      return input.replace(/^\/+|\/+$/g, '');
+    }
+
+    async function deriveWrappingKey(password, salt) {
+      const hashHex = await window.hashwasm.argon2id({
+        password,
+        salt,
+        iterations: 3,
+        memorySize: 256,
+        parallelism: 1,
+        hashLength: 32,
+        outputType: 'hex'
+      });
+
+      return crypto.subtle.importKey(
+        'raw',
+        hexToBytes(hashHex),
+        { name: 'AES-GCM' },
+        false,
+        ['encrypt', 'decrypt']
+      );
+    }
+
+    async function createEncryptedRoomKey(password, salt) {
+      
+      const wrappingKey = await deriveWrappingKey(password, salt);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const roomKey = crypto.getRandomValues(new Uint8Array(32));
+      const encrypted = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv },
+        wrappingKey,
+        roomKey
+      );
+
+      return { iv, roomKey, encryptedRoomKey: new Uint8Array(encrypted) };
+    }
+
+    async function storeRoomKey(roomID, encryptedRoomKey, iv) {
+      const response = await fetch('/api', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          room_id: roomID,
+          room_key: bytesToBase64(encryptedRoomKey),
+          IV: bytesToBase64(iv)
+        })
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+    }
+
+    async function importMessageKey() {
+      return crypto.subtle.importKey(
+        'raw',
+        window.roomKey,
+        { name: 'AES-GCM' },
+        false,
+        ['encrypt', 'decrypt']
+      );
+    }
+
+    async function encryptMessage(text) {
+      const key = await importMessageKey();
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const plaintext = new TextEncoder().encode(text);
+      const ciphertext = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv },
+        key,
+        plaintext
+      );
+      return { ciphertext: new Uint8Array(ciphertext), iv };
+    }
+
+    async function decryptMessage(ciphertext, iv) {
+      const key = await importMessageKey();
+      const plaintext = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv },
+        key,
+        ciphertext
+      );
+      return new TextDecoder().decode(plaintext);
+    }
+
+    function appendMessage(text) {
+      if (messagesElement.textContent.trim() === 'Сообщений пока нет.') {
+        messagesElement.textContent = '';
+      }
+      const messageElement = document.createElement('div');
+      messageElement.textContent = text;
+      messageElement.style.marginBottom = '8px';
+      messagesElement.appendChild(messageElement);
+      messagesElement.scrollTop = messagesElement.scrollHeight;
+    }
+
+    async function pollMessages() {
+      if (!window.roomID || !window.roomKey || pollingInProgress) {
+        return;
+      }
+      pollingInProgress = true;
+      try {
+        const params = new URLSearchParams({
+          room_id: window.roomID,
+          after_id: String(lastMessageID)
+        });
+        const response = await fetch(`/messages?${params}`);
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const messages = await response.json();
+        for (const message of messages) {
+          try {
+            const text = await decryptMessage(
+              base64ToBytes(message.ciphertext),
+              base64ToBytes(message.iv)
+            );
+            appendMessage(text);
+          } catch (error) {
+            appendMessage('[не удалось расшифровать сообщение]');
+          }
+          lastMessageID = Math.max(lastMessageID, Number(message.id));
+        }
+      } catch (error) {
+        console.error('Не удалось получить сообщения', error);
+      } finally {
+        pollingInProgress = false;
+      }
+    }
+
+    function startRoom(roomID, roomKey) {
+      window.roomID = roomID;
+      window.roomKey = roomKey;
+      roomIdElement.textContent = roomID;
+      roomIdInput.value = roomID;
+      messageInput.value = '';
+      messagesElement.textContent = 'Сообщений пока нет.';
+      lastMessageID = 0;
+      if (pollingTimer !== null) {
+        clearInterval(pollingTimer);
+      }
+      homeView.hidden = true;
+      roomView.hidden = false;
+      pollingTimer = setInterval(pollMessages, 1500);
+      pollMessages();
+    }
+
+    const createForm = document.getElementById('create-form');
+    const connectForm = document.getElementById('connect-form');
+    const initialRoomID = normalizeRoomID(roomIdElement.textContent);
+    if (initialRoomID) {
+      connectForm.elements.room_id.value = initialRoomID;
+      connectForm.classList.add('active');
+    }
+
+    createForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const password = createForm.elements.password.value;
+      const passwordConfirmation = createForm.elements.password_confirmation.value;
+      const expire = createForm.elements.expire.value;
+      if (password !== passwordConfirmation) {
+        alert('Пароли не совпадают');
+        return;
+      }
+
+      try {
+        const createResponse = await fetch('/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ expire })
+        });
+        if (!createResponse.ok) {
+          throw new Error(`HTTP ${createResponse.status}`);
+        }
+        const data = await createResponse.json();
+        const roomID = data.room_id;
+        const salt = base64ToBytes(data.salt);
+        const encryptedRoomKey = await createEncryptedRoomKey(password, salt);
+        await storeRoomKey(roomID, encryptedRoomKey.encryptedRoomKey, encryptedRoomKey.iv);
+        history.pushState({}, '', `/${roomID}`);
+        startRoom(roomID, encryptedRoomKey.roomKey);
+      } catch (error) {
+        console.error('Не удалось создать комнату', error);
+        alert('Не удалось создать комнату');
+      }
+    });
+
+    connectForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const password = connectForm.elements.password.value;
+      const roomID = normalizeRoomID(connectForm.elements.room_id.value);
+      if (!roomID) {
+        alert('Укажи ID комнаты');
+        return;
+      }
+
+      try {
+        const response = await fetch('/connect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ room_id: roomID })
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        const salt = base64ToBytes(data.salt);
+        const encryptedRoomKey = base64ToBytes(data.room_key);
+        const iv = base64ToBytes(data.iv);
+        const wrappingKey = await deriveWrappingKey(password, salt);
+        const decryptedRoomKey = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv },
+          wrappingKey,
+          encryptedRoomKey
+        );
+        history.pushState({}, '', `/${roomID}`);
+        startRoom(roomID, new Uint8Array(decryptedRoomKey));
+      } catch (error) {
+        console.error('Не удалось подключиться к комнате', error);
+        alert('Неверный пароль, ID комнаты или повреждённый ключ');
+      }
+    });
+
+    messageForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const text = messageInput.value.trim();
+      if (!text || !window.roomID || !window.roomKey) {
+        return;
+      }
+
+      try {
+        const encrypted = await encryptMessage(text);
+        const response = await fetch('/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            room_id: window.roomID,
+            ciphertext: bytesToBase64(encrypted.ciphertext),
+            iv: bytesToBase64(encrypted.iv)
+          })
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        messageInput.value = '';
+        pollMessages();
+      } catch (error) {
+        console.error('Не удалось отправить сообщение', error);
+        alert('Не удалось отправить сообщение');
+      }
+    });
+  </script>
+</body>
+</html>
