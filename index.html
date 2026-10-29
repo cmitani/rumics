@@ -50,7 +50,40 @@
       border-radius: 10px;
       color: #8f909b;
       background: #101116;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      overflow-y: auto;
     }
+    .message {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      max-width: 82%;
+    }
+    .message.own { align-self: flex-end; align-items: flex-end; }
+    .message.system { align-self: center; max-width: 100%; }
+    .bubble {
+      padding: 9px 13px;
+      border-radius: 14px;
+      border-bottom-left-radius: 4px;
+      background: #262833;
+      color: #f4f4f5;
+      line-height: 1.35;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .message.own .bubble {
+      background: #7c5cff;
+      border-bottom-left-radius: 14px;
+      border-bottom-right-radius: 4px;
+    }
+    .message.system .bubble {
+      background: transparent;
+      border: 1px dashed #2a2c36;
+      color: #8f909b;
+    }
+    .message-time { margin-top: 3px; font-size: .72rem; color: #8f909b; }
     .composer { display: flex; gap: 10px; margin-top: 16px; }
     .composer input { flex: 1; min-width: 0; }
     .composer button { width: auto; padding-inline: 20px; background: #7c5cff; color: white; }
@@ -73,6 +106,14 @@
         <label>
           Время жизни(часы)
           <input name="expire" type="number" min="1" required autocomplete="off">
+        </label>
+        <label>
+          Удаление после бездействия (часы)
+          <input name="idle_expire" type="number" min="0" step="0.5" placeholder="0 — не удалять" autocomplete="off">
+        </label>
+        <label>
+          Лимит сообщений
+          <input name="max_messages" type="number" min="0" step="1" placeholder="0 — без лимита" autocomplete="off">
         </label>
         <label>
           Пароль комнаты
@@ -103,6 +144,7 @@
     <div id="room-view" hidden>
       <h1>Rumics room</h1>
       <p class="subtitle">Room ID: <span id="room-id">{{ .RoomID }}</span></p>
+      <p class="subtitle" id="room-settings" hidden></p>
 
       <section class="panel room-panel">
         <div id="messages" class="messages">
@@ -136,9 +178,16 @@
     const messageForm = document.getElementById('message-form');
     const messageInput = document.getElementById('message-input');
     const messagesElement = document.getElementById('messages');
+    const roomSettingsElement = document.getElementById('room-settings');
     let lastMessageID = 0;
     let pollingTimer = null;
     let pollingInProgress = false;
+
+    // ID этой вкладки: уходит внутрь шифрованного payload, по нему сообщения
+    // делятся на свои и чужие. Сервер его не видит.
+    const clientID = Array.from(crypto.getRandomValues(new Uint8Array(8)))
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
 
     document.querySelectorAll('[data-open]').forEach((button) => {
       button.addEventListener('click', () => {
@@ -245,7 +294,8 @@
     async function encryptMessage(text) {
       const key = await importMessageKey();
       const iv = crypto.getRandomValues(new Uint8Array(12));
-      const plaintext = new TextEncoder().encode(text);
+      const payload = JSON.stringify({ v: 1, uid: clientID, text });
+      const plaintext = new TextEncoder().encode(payload);
       const ciphertext = await crypto.subtle.encrypt(
         { name: 'AES-GCM', iv },
         key,
@@ -264,15 +314,52 @@
       return new TextDecoder().decode(plaintext);
     }
 
-    function appendMessage(text) {
-      if (messagesElement.textContent.trim() === 'Сообщений пока нет.') {
-        messagesElement.textContent = '';
+    function parsePayload(plaintext) {
+      try {
+        const data = JSON.parse(plaintext);
+        if (data && data.v === 1 && typeof data.uid === 'string' && typeof data.text === 'string') {
+          return data;
+        }
+      } catch (error) {
+        // Не JSON — сообщение старого формата, там был голый текст.
       }
+      return { uid: null, text: plaintext };
+    }
+
+    function formatTime(isoString) {
+      const date = new Date(isoString);
+      if (Number.isNaN(date.getTime())) {
+        return '';
+      }
+      const hours = String(date.getHours()).padStart(2, '0');
+      const minutes = String(date.getMinutes()).padStart(2, '0');
+      return `${hours}:${minutes}`;
+    }
+
+    function appendMessage(text, timeLabel, kind) {
+      if (messagesElement.dataset.empty !== 'false') {
+        messagesElement.textContent = '';
+        messagesElement.dataset.empty = 'false';
+      }
+      // Не дёргать скролл, если пользователь ушёл вверх читать историю.
+      const nearBottom =
+        messagesElement.scrollHeight - messagesElement.scrollTop - messagesElement.clientHeight < 80;
       const messageElement = document.createElement('div');
-      messageElement.textContent = text;
-      messageElement.style.marginBottom = '8px';
+      messageElement.classList.add('message');
+      if (kind) {
+        messageElement.classList.add(kind);
+      }
+      const bubbleElement = document.createElement('div');
+      bubbleElement.className = 'bubble';
+      bubbleElement.textContent = text;
+      const timeElement = document.createElement('div');
+      timeElement.className = 'message-time';
+      timeElement.textContent = timeLabel;
+      messageElement.append(bubbleElement, timeElement);
       messagesElement.appendChild(messageElement);
-      messagesElement.scrollTop = messagesElement.scrollHeight;
+      if (nearBottom) {
+        messagesElement.scrollTop = messagesElement.scrollHeight;
+      }
     }
 
     async function pollMessages() {
@@ -292,13 +379,17 @@
         const messages = await response.json();
         for (const message of messages) {
           try {
-            const text = await decryptMessage(
+            const payload = parsePayload(await decryptMessage(
               base64ToBytes(message.ciphertext),
               base64ToBytes(message.iv)
+            ));
+            appendMessage(
+              payload.text,
+              formatTime(message.created_at),
+              payload.uid === clientID ? 'own' : ''
             );
-            appendMessage(text);
           } catch (error) {
-            appendMessage('[не удалось расшифровать сообщение]');
+            appendMessage('[не удалось расшифровать сообщение]', formatTime(message.created_at), 'system');
           }
           lastMessageID = Math.max(lastMessageID, Number(message.id));
         }
@@ -309,13 +400,34 @@
       }
     }
 
-    function startRoom(roomID, roomKey) {
+    function describeRoomSettings(settings) {
+      if (!settings) {
+        return '';
+      }
+      const parts = [];
+      if (settings.expire_hours) {
+        parts.push(`время жизни ${settings.expire_hours} ч`);
+      }
+      if (settings.idle_hours) {
+        parts.push(`удаление после ${settings.idle_hours} ч без сообщений`);
+      }
+      if (settings.max_messages) {
+        parts.push(`лимит ${settings.max_messages} сообщений`);
+      }
+      return parts.join(' · ');
+    }
+
+    function startRoom(roomID, roomKey, settings) {
       window.roomID = roomID;
       window.roomKey = roomKey;
       roomIdElement.textContent = roomID;
       roomIdInput.value = roomID;
       messageInput.value = '';
+      const description = describeRoomSettings(settings);
+      roomSettingsElement.textContent = description;
+      roomSettingsElement.hidden = !description;
       messagesElement.textContent = 'Сообщений пока нет.';
+      messagesElement.dataset.empty = 'true';
       lastMessageID = 0;
       if (pollingTimer !== null) {
         clearInterval(pollingTimer);
@@ -339,6 +451,8 @@
       const password = createForm.elements.password.value;
       const passwordConfirmation = createForm.elements.password_confirmation.value;
       const expire = createForm.elements.expire.value;
+      const idleExpire = createForm.elements.idle_expire.value;
+      const maxMessages = createForm.elements.max_messages.value;
       if (password !== passwordConfirmation) {
         alert('Пароли не совпадают');
         return;
@@ -348,7 +462,11 @@
         const createResponse = await fetch('/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ expire })
+          body: new URLSearchParams({
+            expire,
+            idle_expire: idleExpire || '0',
+            max_messages: maxMessages || '0'
+          })
         });
         if (!createResponse.ok) {
           throw new Error(`HTTP ${createResponse.status}`);
@@ -359,7 +477,11 @@
         const encryptedRoomKey = await createEncryptedRoomKey(password, salt);
         await storeRoomKey(roomID, encryptedRoomKey.encryptedRoomKey, encryptedRoomKey.iv);
         history.pushState({}, '', `/${roomID}`);
-        startRoom(roomID, encryptedRoomKey.roomKey);
+        startRoom(roomID, encryptedRoomKey.roomKey, {
+          expire_hours: Number(expire),
+          idle_hours: Number(idleExpire) || 0,
+          max_messages: Number(maxMessages) || 0
+        });
       } catch (error) {
         console.error('Не удалось создать комнату', error);
         alert('Не удалось создать комнату');
@@ -395,7 +517,7 @@
           encryptedRoomKey
         );
         history.pushState({}, '', `/${roomID}`);
-        startRoom(roomID, new Uint8Array(decryptedRoomKey));
+        startRoom(roomID, new Uint8Array(decryptedRoomKey), data.settings || null);
       } catch (error) {
         console.error('Не удалось подключиться к комнате', error);
         alert('Неверный пароль, ID комнаты или повреждённый ключ');
@@ -421,6 +543,10 @@
           })
         });
         if (!response.ok) {
+          if (response.status === 403 || response.status === 429) {
+            alert('Лимит сообщений комнаты исчерпан');
+            return;
+          }
           throw new Error(`HTTP ${response.status}`);
         }
         messageInput.value = '';
