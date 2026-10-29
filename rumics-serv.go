@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -51,6 +53,27 @@ func createHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, c
 		http.Error(w, "неверное значение expire", http.StatusBadRequest)
 		return
 	}
+	// Пусто или 0 — настройка выключена, в БД уйдёт NULL.
+	var idle_minutes *int
+	if value := strings.TrimSpace(r.FormValue("idle_expire")); value != "" && value != "0" {
+		idle_expire, err := strconv.Atoi(value)
+		if err != nil || idle_expire < 0 {
+			http.Error(w, "неверное значение idle_expire", http.StatusBadRequest)
+			return
+		}
+		idle_expire *= 60 // в форме часы, в колонке минуты
+		idle_minutes = &idle_expire
+	}
+
+	var max_messages *int
+	if value := strings.TrimSpace(r.FormValue("max_messages")); value != "" && value != "0" {
+		limit, err := strconv.Atoi(value)
+		if err != nil || limit < 0 {
+			http.Error(w, "неверное значение max_messages", http.StatusBadRequest)
+			return
+		}
+		max_messages = &limit
+	}
 
 	expireDate := time.Now().Add(time.Duration(hours) * time.Hour)
 
@@ -68,8 +91,8 @@ func createHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, c
 	}
 
 	_, err = pool.Exec(ctx,
-		"INSERT INTO rooms (id, expire, salt) VALUES ($1, $2, $3)",
-		roomID, expireDate, salt,
+		"INSERT INTO rooms (id, expire, salt, idle_minutes, max_messages) VALUES ($1, $2, $3, $4, $5)",
+		roomID, expireDate, salt, idle_minutes, max_messages,
 	)
 	if err != nil {
 		log.Print(err)
@@ -196,14 +219,29 @@ func storeMessage(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ct
 		http.Error(w, "room ID is required", http.StatusBadRequest)
 		return
 	}
+	const storeMessageQuery = `
+		WITH bumped AS (
+			UPDATE rooms
+			SET message_count = message_count + 1,
+			    last_activity = now()
+			WHERE id = $1
+			  AND expire > now()
+			  AND (max_messages IS NULL OR message_count < max_messages)
+			RETURNING 1
+		)
+		INSERT INTO messages (room_id, ciphertext, iv)
+		SELECT $1, $2, $3 FROM bumped
+		RETURNING id, created_at
+	`
 
 	var messageID int64
 	var createdAt time.Time
 
-	err = pool.QueryRow(ctx,
-		"INSERT INTO messages (room_id, ciphertext, iv) VALUES ($1, $2, $3) RETURNING id, created_at",
-		roomID, ciphertext, iv,
-	).Scan(&messageID, &createdAt)
+	err = pool.QueryRow(ctx, storeMessageQuery, roomID, ciphertext, iv).Scan(&messageID, &createdAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		http.Error(w, "комната не найдена, истекла или лимит сообщений исчерпан", http.StatusForbidden)
+		return
+	}
 	if err != nil {
 		log.Print(err)
 		http.Error(w, "не удалось сохранить сообщение", http.StatusInternalServerError)
@@ -276,7 +314,11 @@ func checker(pool *pgxpool.Pool, ctx context.Context) {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		_, err := pool.Exec(ctx, "DELETE FROM rooms WHERE expire <= now()")
+		_, err := pool.Exec(ctx, `
+			DELETE FROM rooms
+			WHERE expire <= now()
+				OR (idle_minutes IS NOT NULL
+					AND last_activity + idle_minutes * interval '1 minute' <= now())`)
 		if err != nil {
 			log.Print(err)
 		}

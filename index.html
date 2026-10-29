@@ -183,8 +183,7 @@
     let pollingTimer = null;
     let pollingInProgress = false;
 
-    // ID этой вкладки: уходит внутрь шифрованного payload, по нему сообщения
-    // делятся на свои и чужие. Сервер его не видит.
+    
     const clientID = Array.from(crypto.getRandomValues(new Uint8Array(8)))
       .map((byte) => byte.toString(16).padStart(2, '0'))
       .join('');
@@ -321,7 +320,7 @@
           return data;
         }
       } catch (error) {
-        // Не JSON — сообщение старого формата, там был голый текст.
+        
       }
       return { uid: null, text: plaintext };
     }
@@ -341,7 +340,7 @@
         messagesElement.textContent = '';
         messagesElement.dataset.empty = 'false';
       }
-      // Не дёргать скролл, если пользователь ушёл вверх читать историю.
+      
       const nearBottom =
         messagesElement.scrollHeight - messagesElement.scrollTop - messagesElement.clientHeight < 80;
       const messageElement = document.createElement('div');
