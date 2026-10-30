@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -126,15 +127,30 @@ func connectHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, 
 	var salt []byte
 	var encryptedRoomKey []byte
 	var iv []byte
+	var expire time.Time
+	var idleMinutes *int
+	var maxMessages *int
 
 	err := pool.QueryRow(ctx,
-		"SELECT salt, key, IV FROM rooms WHERE id = $1",
+		"SELECT salt, key, IV, expire, idle_minutes, max_messages FROM rooms WHERE id = $1",
 		roomID,
-	).Scan(&salt, &encryptedRoomKey, &iv)
+	).Scan(&salt, &encryptedRoomKey, &iv, &expire, &idleMinutes, &maxMessages)
 	if err != nil {
 		log.Print(err)
 		http.Error(w, "комната не найдена или ключ ещё не сохранён", http.StatusNotFound)
 		return
+	}
+
+	expireHours := math.Ceil(time.Until(expire).Hours())
+	if expireHours < 0 {
+		expireHours = 0
+	}
+	settings := map[string]any{"expire_hours": int(expireHours)}
+	if idleMinutes != nil {
+		settings["idle_hours"] = float64(*idleMinutes) / 60
+	}
+	if maxMessages != nil {
+		settings["max_messages"] = *maxMessages
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -142,6 +158,7 @@ func connectHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, 
 		"room_key": encryptedRoomKey,
 		"salt":     salt,
 		"iv":       iv,
+		"settings": settings,
 	}); err != nil {
 		log.Print(err)
 	}
