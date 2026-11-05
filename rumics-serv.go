@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -23,11 +25,71 @@ import (
 
 var mainTemplatePath = "index.html"
 
+const sessionCookieName = "rumics_session"
+
 type messageResponse struct {
 	ID         int64     `json:"id"`
 	Ciphertext []byte    `json:"ciphertext"`
 	IV         []byte    `json:"iv"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+type session struct {
+	roomID    string
+	expiresAt time.Time
+}
+
+type sessionStore struct {
+	mu     sync.Mutex
+	tokens map[string]session
+	ttl    time.Duration
+}
+
+func newSessionStore(ttl time.Duration) *sessionStore {
+	return &sessionStore{tokens: make(map[string]session), ttl: ttl}
+}
+
+func (s *sessionStore) create(roomID string) (string, error) {
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(tokenBytes)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for value, sess := range s.tokens {
+		if now.After(sess.expiresAt) {
+			delete(s.tokens, value)
+		}
+	}
+	s.tokens[token] = session{roomID: roomID, expiresAt: now.Add(s.ttl)}
+	return token, nil
+}
+
+func (s *sessionStore) verify(token string, roomID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.tokens[token]
+	if !ok || time.Now().After(sess.expiresAt) || sess.roomID != roomID {
+		if ok {
+			delete(s.tokens, token)
+		}
+		return false
+	}
+	return true
+}
+
+func isHTTPS(r *http.Request) bool {
+	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+}
+
+func requireSession(r *http.Request, roomID string, sessions *sessionStore) bool {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return false
+	}
+	return sessions.verify(cookie.Value, roomID)
 }
 
 func renderTemplate(w http.ResponseWriter, templatePath string, data any) {
@@ -184,10 +246,15 @@ func storeRoomKeyHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.P
 		http.Error(w, "invalid IV", http.StatusBadRequest)
 		return
 	}
+	keyHash, err := base64.StdEncoding.DecodeString(r.FormValue("key_hash"))
+	if err != nil || len(keyHash) == 0 {
+		http.Error(w, "invalid key hash", http.StatusBadRequest)
+		return
+	}
 
 	result, err := pool.Exec(ctx,
-		"UPDATE rooms SET key = $1, IV = $2 WHERE id = $3",
-		encryptedRoomKey, iv, roomID,
+		"UPDATE rooms SET key = $1, IV = $2, key_hash = $3 WHERE id = $4",
+		encryptedRoomKey, iv, keyHash, roomID,
 	)
 	if err != nil {
 		log.Print(err)
@@ -202,19 +269,63 @@ func storeRoomKeyHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.P
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func messagesHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context) {
+func authHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	roomID := strings.TrimSpace(r.FormValue("room_id"))
+	keyHash, err := base64.StdEncoding.DecodeString(r.FormValue("key_hash"))
+	if roomID == "" || err != nil || len(keyHash) == 0 {
+		http.Error(w, "room ID and key hash are required", http.StatusBadRequest)
+		return
+	}
+
+	var storedHash []byte
+	err = pool.QueryRow(ctx,
+		"SELECT key_hash FROM rooms WHERE id = $1",
+		roomID,
+	).Scan(&storedHash)
+	if err != nil {
+		http.Error(w, "комната не найдена", http.StatusNotFound)
+		return
+	}
+	if storedHash == nil || len(storedHash) != len(keyHash) ||
+		subtle.ConstantTimeCompare(storedHash, keyHash) != 1 {
+		http.Error(w, "неверный отпечаток ключа", http.StatusForbidden)
+		return
+	}
+
+	token, err := sessions.create(roomID)
+	if err != nil {
+		http.Error(w, "не удалось создать сессию", http.StatusInternalServerError)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(sessions.ttl.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   isHTTPS(r),
+	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func messagesHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore) {
 	if r.Method == http.MethodPost {
-		storeMessage(w, r, pool, ctx)
+		storeMessage(w, r, pool, ctx, sessions)
 		return
 	}
 	if r.Method == http.MethodGet {
-		listMessages(w, r, pool, ctx)
+		listMessages(w, r, pool, ctx, sessions)
 		return
 	}
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 }
 
-func storeMessage(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context) {
+func storeMessage(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore) {
 
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -234,6 +345,10 @@ func storeMessage(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ct
 	}
 	if roomID == "" {
 		http.Error(w, "room ID is required", http.StatusBadRequest)
+		return
+	}
+	if !requireSession(r, roomID, sessions) {
+		http.Error(w, "нет активной сессии для комнаты", http.StatusUnauthorized)
 		return
 	}
 	const storeMessageQuery = `
@@ -274,11 +389,15 @@ func storeMessage(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ct
 	}
 }
 
-func listMessages(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context) {
+func listMessages(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore) {
 
 	roomID := strings.TrimSpace(r.URL.Query().Get("room_id"))
 	if roomID == "" {
 		http.Error(w, "room ID is required", http.StatusBadRequest)
+		return
+	}
+	if !requireSession(r, roomID, sessions) {
+		http.Error(w, "нет активной сессии для комнаты", http.StatusUnauthorized)
 		return
 	}
 
@@ -360,6 +479,8 @@ func main() {
 
 	go checker(pool, ctx)
 
+	sessions := newSessionStore(12 * time.Hour)
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			renderTemplate(w, mainTemplatePath, struct{ RoomID string }{})
@@ -384,8 +505,11 @@ func main() {
 	http.HandleFunc("/connect", func(w http.ResponseWriter, r *http.Request) {
 		connectHandler(w, r, pool, ctx)
 	})
+	http.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
+		authHandler(w, r, pool, ctx, sessions)
+	})
 	http.HandleFunc("/messages", func(w http.ResponseWriter, r *http.Request) {
-		messagesHandler(w, r, pool, ctx)
+		messagesHandler(w, r, pool, ctx, sessions)
 	})
 
 	if err := http.ListenAndServe(":8080", nil); err != nil {

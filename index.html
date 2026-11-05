@@ -236,7 +236,7 @@
         password,
         salt,
         iterations: 3,
-        memorySize: 256,
+        memorySize: 65536,
         parallelism: 1,
         hashLength: 32,
         outputType: 'hex'
@@ -265,14 +265,34 @@
       return { iv, roomKey, encryptedRoomKey: new Uint8Array(encrypted) };
     }
 
-    async function storeRoomKey(roomID, encryptedRoomKey, iv) {
+    async function storeRoomKey(roomID, encryptedRoomKey, iv, keyHash) {
       const response = await fetch('/api', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
           room_id: roomID,
           room_key: bytesToBase64(encryptedRoomKey),
-          IV: bytesToBase64(iv)
+          IV: bytesToBase64(iv),
+          key_hash: keyHash
+        })
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+    }
+
+    async function roomKeyHash(roomKey) {
+      const digest = await crypto.subtle.digest('SHA-256', roomKey);
+      return bytesToBase64(new Uint8Array(digest));
+    }
+
+    async function authSession(roomID, keyHash) {
+      const response = await fetch('/auth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          room_id: roomID,
+          key_hash: keyHash
         })
       });
       if (!response.ok) {
@@ -372,6 +392,14 @@
           after_id: String(lastMessageID)
         });
         const response = await fetch(`/messages?${params}`);
+        if (response.status === 401) {
+          if (pollingTimer !== null) {
+            clearInterval(pollingTimer);
+            pollingTimer = null;
+          }
+          alert('Сессия истекла, перезагрузи страницу и подключись заново');
+          return;
+        }
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }
@@ -474,7 +502,9 @@
         const roomID = data.room_id;
         const salt = base64ToBytes(data.salt);
         const encryptedRoomKey = await createEncryptedRoomKey(password, salt);
-        await storeRoomKey(roomID, encryptedRoomKey.encryptedRoomKey, encryptedRoomKey.iv);
+        const keyHash = await roomKeyHash(encryptedRoomKey.roomKey);
+        await storeRoomKey(roomID, encryptedRoomKey.encryptedRoomKey, encryptedRoomKey.iv, keyHash);
+        await authSession(roomID, keyHash);
         history.pushState({}, '', `/${roomID}`);
         startRoom(roomID, encryptedRoomKey.roomKey, {
           expire_hours: Number(expire),
@@ -515,6 +545,8 @@
           wrappingKey,
           encryptedRoomKey
         );
+        const keyHash = await roomKeyHash(new Uint8Array(decryptedRoomKey));
+        await authSession(roomID, keyHash);
         history.pushState({}, '', `/${roomID}`);
         startRoom(roomID, new Uint8Array(decryptedRoomKey), data.settings || null);
       } catch (error) {
@@ -542,6 +574,10 @@
           })
         });
         if (!response.ok) {
+          if (response.status === 401) {
+            alert('Сессия истекла, перезагрузи страницу и подключись заново');
+            return;
+          }
           if (response.status === 403 || response.status === 429) {
             alert('Лимит сообщений комнаты исчерпан');
             return;
