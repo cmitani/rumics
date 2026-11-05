@@ -54,7 +54,7 @@ func createHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, c
 		http.Error(w, "неверное значение expire", http.StatusBadRequest)
 		return
 	}
-	// Пусто или 0 — настройка выключена, в БД уйдёт NULL.
+	
 	var idle_minutes *int
 	if value := strings.TrimSpace(r.FormValue("idle_expire")); value != "" && value != "0" {
 		idle_expire, err := strconv.Atoi(value)
@@ -62,7 +62,7 @@ func createHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, c
 			http.Error(w, "неверное значение idle_expire", http.StatusBadRequest)
 			return
 		}
-		idle_expire *= 60 // в форме часы, в колонке минуты
+		idle_expire *= 60 
 		idle_minutes = &idle_expire
 	}
 
