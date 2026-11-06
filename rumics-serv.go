@@ -156,13 +156,10 @@ func wsHandler(h *hub, sessions *sessionStore) http.HandlerFunc {
 		}
 		defer conn.CloseNow()
 
-		ctx, cancel := context.WithCancel(r.Context())
+		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		go func() {
-			defer cancel()
-			conn.CloseRead(ctx)
-		}()
+		ctx = conn.CloseRead(ctx)
 
 		h.subscribe(roomID, conn)
 		defer h.unsubscribe(roomID, conn)
