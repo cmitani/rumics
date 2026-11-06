@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -90,6 +91,98 @@ func requireSession(r *http.Request, roomID string, sessions *sessionStore) bool
 		return false
 	}
 	return sessions.verify(cookie.Value, roomID)
+}
+
+type hub struct {
+	mu    sync.Mutex
+	rooms map[string]map[*websocket.Conn]struct{}
+}
+
+func newHub() *hub {
+	return &hub{rooms: make(map[string]map[*websocket.Conn]struct{})}
+}
+
+func (h *hub) subscribe(roomID string, conn *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.rooms[roomID] == nil {
+		h.rooms[roomID] = make(map[*websocket.Conn]struct{})
+	}
+	h.rooms[roomID][conn] = struct{}{}
+}
+
+func (h *hub) unsubscribe(roomID string, conn *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if room, ok := h.rooms[roomID]; ok {
+		delete(room, conn)
+		if len(room) == 0 {
+			delete(h.rooms, roomID)
+		}
+	}
+}
+
+func (h *hub) broadcast(roomID string, payload []byte) {
+	h.mu.Lock()
+	conns := make([]*websocket.Conn, 0, len(h.rooms[roomID]))
+	for conn := range h.rooms[roomID] {
+		conns = append(conns, conn)
+	}
+	h.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, conn := range conns {
+		if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
+			h.unsubscribe(roomID, conn)
+			conn.CloseNow()
+		}
+	}
+}
+
+func wsHandler(h *hub, sessions *sessionStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		roomID := strings.TrimSpace(r.URL.Query().Get("room_id"))
+		if roomID == "" {
+			http.Error(w, "room ID is required", http.StatusBadRequest)
+			return
+		}
+		if !requireSession(r, roomID, sessions) {
+			http.Error(w, "нет активной сессии для комнаты", http.StatusUnauthorized)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+
+		go func() {
+			defer cancel()
+			conn.CloseRead(ctx)
+		}()
+
+		h.subscribe(roomID, conn)
+		defer h.unsubscribe(roomID, conn)
+
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				pingCtx, pingCancel := context.WithTimeout(ctx, 10*time.Second)
+				pingErr := conn.Ping(pingCtx)
+				pingCancel()
+				if pingErr != nil {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
 }
 
 func renderTemplate(w http.ResponseWriter, templatePath string, data any) {
@@ -313,9 +406,9 @@ func authHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func messagesHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore) {
+func messagesHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore, h *hub) {
 	if r.Method == http.MethodPost {
-		storeMessage(w, r, pool, ctx, sessions)
+		storeMessage(w, r, pool, ctx, sessions, h)
 		return
 	}
 	if r.Method == http.MethodGet {
@@ -325,7 +418,7 @@ func messagesHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool,
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 }
 
-func storeMessage(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore) {
+func storeMessage(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore, h *hub) {
 
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -378,6 +471,17 @@ func storeMessage(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ct
 		log.Print(err)
 		http.Error(w, "не удалось сохранить сообщение", http.StatusInternalServerError)
 		return
+	}
+
+	broadcastPayload, err := json.Marshal(map[string]any{
+		"type":       "message",
+		"id":         messageID,
+		"ciphertext": ciphertext,
+		"iv":         iv,
+		"created_at": createdAt,
+	})
+	if err == nil {
+		h.broadcast(roomID, broadcastPayload)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -480,6 +584,7 @@ func main() {
 	go checker(pool, ctx)
 
 	sessions := newSessionStore(12 * time.Hour)
+	messageHub := newHub()
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
@@ -508,8 +613,9 @@ func main() {
 	http.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
 		authHandler(w, r, pool, ctx, sessions)
 	})
+	http.HandleFunc("/ws", wsHandler(messageHub, sessions))
 	http.HandleFunc("/messages", func(w http.ResponseWriter, r *http.Request) {
-		messagesHandler(w, r, pool, ctx, sessions)
+		messagesHandler(w, r, pool, ctx, sessions, messageHub)
 	})
 
 	if err := http.ListenAndServe(":8080", nil); err != nil {
