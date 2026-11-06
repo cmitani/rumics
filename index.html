@@ -182,6 +182,10 @@
     let lastMessageID = 0;
     let pollingTimer = null;
     let pollingInProgress = false;
+    let wsConnection = null;
+    let wsConnected = false;
+    let wsReconnectDelay = 1000;
+    let wsReconnectTimer = null;
 
     
     const clientID = Array.from(crypto.getRandomValues(new Uint8Array(8)))
@@ -381,8 +385,28 @@
       }
     }
 
+    async function renderIncoming(message) {
+      if (Number(message.id) <= lastMessageID) {
+        return;
+      }
+      try {
+        const payload = parsePayload(await decryptMessage(
+          base64ToBytes(message.ciphertext),
+          base64ToBytes(message.iv)
+        ));
+        appendMessage(
+          payload.text,
+          formatTime(message.created_at),
+          payload.uid === clientID ? 'own' : ''
+        );
+      } catch (error) {
+        appendMessage('[не удалось расшифровать сообщение]', formatTime(message.created_at), 'system');
+      }
+      lastMessageID = Math.max(lastMessageID, Number(message.id));
+    }
+
     async function pollMessages() {
-      if (!window.roomID || !window.roomKey || pollingInProgress) {
+      if (!window.roomID || !window.roomKey || pollingInProgress || wsConnected) {
         return;
       }
       pollingInProgress = true;
@@ -405,26 +429,41 @@
         }
         const messages = await response.json();
         for (const message of messages) {
-          try {
-            const payload = parsePayload(await decryptMessage(
-              base64ToBytes(message.ciphertext),
-              base64ToBytes(message.iv)
-            ));
-            appendMessage(
-              payload.text,
-              formatTime(message.created_at),
-              payload.uid === clientID ? 'own' : ''
-            );
-          } catch (error) {
-            appendMessage('[не удалось расшифровать сообщение]', formatTime(message.created_at), 'system');
-          }
-          lastMessageID = Math.max(lastMessageID, Number(message.id));
+          await renderIncoming(message);
         }
       } catch (error) {
         console.error('Не удалось получить сообщения', error);
       } finally {
         pollingInProgress = false;
       }
+    }
+
+    function connectWS(roomID) {
+      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      wsConnection = new WebSocket(`${protocol}://${window.location.host}/ws?room_id=${encodeURIComponent(roomID)}`);
+      wsConnection.onopen = () => {
+        pollMessages();
+        wsConnected = true;
+        wsReconnectDelay = 1000;
+      };
+      wsConnection.onmessage = (event) => {
+        let envelope;
+        try {
+          envelope = JSON.parse(event.data);
+        } catch (error) {
+          return;
+        }
+        if (envelope.type === 'message') {
+          renderIncoming(envelope);
+        }
+      };
+      wsConnection.onclose = () => {
+        wsConnected = false;
+        if (window.roomID === roomID) {
+          wsReconnectTimer = setTimeout(() => connectWS(roomID), wsReconnectDelay);
+          wsReconnectDelay = Math.min(wsReconnectDelay * 2, 30000);
+        }
+      };
     }
 
     function describeRoomSettings(settings) {
@@ -459,10 +498,19 @@
       if (pollingTimer !== null) {
         clearInterval(pollingTimer);
       }
+      if (wsConnection) {
+        wsConnection.onclose = null;
+        wsConnection.close();
+        wsConnection = null;
+      }
+      clearTimeout(wsReconnectTimer);
+      wsConnected = false;
+      wsReconnectDelay = 1000;
       homeView.hidden = true;
       roomView.hidden = false;
       pollingTimer = setInterval(pollMessages, 1500);
       pollMessages();
+      connectWS(roomID);
     }
 
     const createForm = document.getElementById('create-form');
