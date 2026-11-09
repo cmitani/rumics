@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 	"github.com/jackc/pgx/v5"
@@ -228,6 +229,16 @@ func createHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, c
 		max_messages = &limit
 	}
 
+	var max_users *int
+	if value := strings.TrimSpace(r.FormValue("max_users")); value != "" && value != "0" {
+		users, err := strconv.Atoi(value)
+		if err != nil || users < 0 {
+			http.Error(w, "неверное значение max_users", http.StatusBadRequest)
+			return
+		}
+		max_users = &users
+	}
+
 	expireDate := time.Now().Add(time.Duration(hours) * time.Hour)
 
 	roomIDBytes := make([]byte, 16)
@@ -244,8 +255,8 @@ func createHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, c
 	}
 
 	_, err = pool.Exec(ctx,
-		"INSERT INTO rooms (id, expire, salt, idle_minutes, max_messages) VALUES ($1, $2, $3, $4, $5)",
-		roomID, expireDate, salt, idle_minutes, max_messages,
+		"INSERT INTO rooms (id, expire, salt, idle_minutes, max_messages, max_users) VALUES ($1, $2, $3, $4, $5, $6)",
+		roomID, expireDate, salt, idle_minutes, max_messages, max_users,
 	)
 	if err != nil {
 		log.Print(err)
@@ -282,14 +293,22 @@ func connectHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, 
 	var expire time.Time
 	var idleMinutes *int
 	var maxMessages *int
+	var maxUsers *int
+	var aliveCount int
 
 	err := pool.QueryRow(ctx,
-		"SELECT salt, key, IV, expire, idle_minutes, max_messages FROM rooms WHERE id = $1",
+		"SELECT salt, key, IV, expire, idle_minutes, max_messages, max_users, "+
+			"(SELECT count(*) FROM users WHERE users.room_id = rooms.id AND NOT dead) "+
+			"FROM rooms WHERE id = $1",
 		roomID,
-	).Scan(&salt, &encryptedRoomKey, &iv, &expire, &idleMinutes, &maxMessages)
+	).Scan(&salt, &encryptedRoomKey, &iv, &expire, &idleMinutes, &maxMessages, &maxUsers, &aliveCount)
 	if err != nil {
 		log.Print(err)
 		http.Error(w, "комната не найдена или ключ ещё не сохранён", http.StatusNotFound)
+		return
+	}
+	if maxUsers != nil && aliveCount >= *maxUsers {
+		http.Error(w, "комната заполнена", http.StatusForbidden)
 		return
 	}
 
@@ -303,6 +322,9 @@ func connectHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, 
 	}
 	if maxMessages != nil {
 		settings["max_messages"] = *maxMessages
+	}
+	if maxUsers != nil {
+		settings["max_users"] = *maxUsers
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -401,6 +423,164 @@ func authHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx
 		Secure:   isHTTPS(r),
 	})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+type memberRow struct {
+	UidHash []byte `json:"uid_hash"`
+	Nick    string `json:"nick"`
+	Dead    bool   `json:"dead"`
+}
+
+func listMembers(pool *pgxpool.Pool, ctx context.Context, roomID string) []memberRow {
+	rows, err := pool.Query(ctx,
+		"SELECT uid_hash, nick, dead FROM users WHERE room_id = $1 ORDER BY joined_at",
+		roomID,
+	)
+	if err != nil {
+		log.Print(err)
+		return []memberRow{}
+	}
+	defer rows.Close()
+
+	members := make([]memberRow, 0)
+	for rows.Next() {
+		var member memberRow
+		if err := rows.Scan(&member.UidHash, &member.Nick, &member.Dead); err != nil {
+			log.Print(err)
+			return members
+		}
+		members = append(members, member)
+	}
+	return members
+}
+
+func broadcastPresence(pool *pgxpool.Pool, ctx context.Context, roomID string, h *hub) {
+	payload, err := json.Marshal(map[string]any{
+		"type":    "presence",
+		"members": listMembers(pool, ctx, roomID),
+	})
+	if err == nil {
+		h.broadcast(roomID, payload)
+	}
+}
+
+func joinHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore, h *hub) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	roomID := strings.TrimSpace(r.FormValue("room_id"))
+	uidHash, err := base64.StdEncoding.DecodeString(r.FormValue("uid_hash"))
+	nick := strings.TrimSpace(r.FormValue("nick"))
+	if roomID == "" || err != nil || len(uidHash) == 0 {
+		http.Error(w, "room ID and uid hash are required", http.StatusBadRequest)
+		return
+	}
+	if utf8.RuneCountInString(nick) > 32 {
+		http.Error(w, "слишком длинный ник", http.StatusBadRequest)
+		return
+	}
+	if !requireSession(r, roomID, sessions) {
+		http.Error(w, "нет активной сессии для комнаты", http.StatusUnauthorized)
+		return
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		log.Print(err)
+		http.Error(w, "не удалось подключиться к комнате", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	var maxUsers *int
+	err = tx.QueryRow(ctx,
+		"SELECT max_users FROM rooms WHERE id = $1 FOR UPDATE",
+		roomID,
+	).Scan(&maxUsers)
+	if err != nil {
+		http.Error(w, "комната не найдена", http.StatusNotFound)
+		return
+	}
+
+	var existingNick *string
+	err = tx.QueryRow(ctx,
+		"SELECT nick FROM users WHERE room_id = $1 AND uid_hash = $2",
+		roomID, uidHash,
+	).Scan(&existingNick)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		log.Print(err)
+		http.Error(w, "не удалось подключиться к комнате", http.StatusInternalServerError)
+		return
+	}
+
+	if existingNick == nil {
+		var total int
+		err = tx.QueryRow(ctx,
+			"SELECT count(*) FROM users WHERE room_id = $1",
+			roomID,
+		).Scan(&total)
+		if err != nil {
+			log.Print(err)
+			http.Error(w, "не удалось подключиться к комнате", http.StatusInternalServerError)
+			return
+		}
+		if maxUsers != nil {
+			var alive int
+			err = tx.QueryRow(ctx,
+				"SELECT count(*) FROM users WHERE room_id = $1 AND NOT dead",
+				roomID,
+			).Scan(&alive)
+			if err != nil {
+				log.Print(err)
+				http.Error(w, "не удалось подключиться к комнате", http.StatusInternalServerError)
+				return
+			}
+			if alive >= *maxUsers {
+				http.Error(w, "комната заполнена", http.StatusForbidden)
+				return
+			}
+		}
+		if nick == "" {
+			nick = fmt.Sprintf("user%d", total+1)
+		}
+		_, err = tx.Exec(ctx,
+			"INSERT INTO users (room_id, uid_hash, nick) VALUES ($1, $2, $3)",
+			roomID, uidHash, nick,
+		)
+	} else if nick == "" {
+		nick = *existingNick
+		_, err = tx.Exec(ctx,
+			"UPDATE users SET last_seen = now(), dead = false WHERE room_id = $1 AND uid_hash = $2",
+			roomID, uidHash,
+		)
+	} else {
+		_, err = tx.Exec(ctx,
+			"UPDATE users SET last_seen = now(), dead = false, nick = $3 WHERE room_id = $1 AND uid_hash = $2",
+			roomID, uidHash, nick,
+		)
+	}
+	if err != nil {
+		log.Print(err)
+		http.Error(w, "не удалось подключиться к комнате", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		log.Print(err)
+		http.Error(w, "не удалось подключиться к комнате", http.StatusInternalServerError)
+		return
+	}
+
+	broadcastPresence(pool, ctx, roomID, h)
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]any{
+		"nick":    nick,
+		"members": listMembers(pool, ctx, roomID),
+	}); err != nil {
+		log.Print(err)
+	}
 }
 
 func messagesHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore, h *hub) {
@@ -545,7 +725,7 @@ func listMessages(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ct
 	}
 }
 
-func checker(pool *pgxpool.Pool, ctx context.Context) {
+func checker(pool *pgxpool.Pool, ctx context.Context, h *hub) {
 
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -558,6 +738,31 @@ func checker(pool *pgxpool.Pool, ctx context.Context) {
 					AND last_activity + idle_minutes * interval '1 minute' <= now())`)
 		if err != nil {
 			log.Print(err)
+		}
+
+		rows, err := pool.Query(ctx, `
+			UPDATE users SET dead = true
+			WHERE dead = false AND last_seen < now() - interval '10 minutes'
+			RETURNING room_id`)
+		if err != nil {
+			log.Print(err)
+			continue
+		}
+		touchedRooms := make(map[string]struct{})
+		for rows.Next() {
+			var roomID string
+			if err := rows.Scan(&roomID); err != nil {
+				log.Print(err)
+				continue
+			}
+			touchedRooms[roomID] = struct{}{}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			log.Print(err)
+		}
+		for roomID := range touchedRooms {
+			broadcastPresence(pool, ctx, roomID, h)
 		}
 	}
 }
@@ -578,10 +783,10 @@ func main() {
 	}
 	defer pool.Close()
 
-	go checker(pool, ctx)
-
 	sessions := newSessionStore(12 * time.Hour)
 	messageHub := newHub()
+
+	go checker(pool, ctx, messageHub)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
@@ -611,6 +816,9 @@ func main() {
 		authHandler(w, r, pool, ctx, sessions)
 	})
 	http.HandleFunc("/ws", wsHandler(messageHub, sessions))
+	http.HandleFunc("/join", func(w http.ResponseWriter, r *http.Request) {
+		joinHandler(w, r, pool, ctx, sessions, messageHub)
+	})
 	http.HandleFunc("/messages", func(w http.ResponseWriter, r *http.Request) {
 		messagesHandler(w, r, pool, ctx, sessions, messageHub)
 	})
