@@ -1,0 +1,11 @@
+CREATE TABLE users (
+	room_id  TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+	uid_hash BYTEA NOT NULL,
+	nick TEXT NOT NULL,
+	joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+	dead BOOLEAN NOT NULL DEFAULT false,
+	PRIMARY KEY (room_id, uid_hash)
+);
+
+ALTER TABLE rooms ADD COLUMN max_users INT;
