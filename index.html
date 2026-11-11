@@ -85,9 +85,19 @@
     }
     .message-time { margin-top: 3px; font-size: .72rem; color: #8f909b; }
     .message-nick { font-size: .75rem; color: #a3a3ad; margin-bottom: 2px; }
+    .file-name { font-weight: 700; margin-bottom: 3px; overflow-wrap: anywhere; }
+    .file-size { font-size: .75rem; color: #b9b9c2; }
+    .file-download {
+      margin-top: 9px;
+      padding: 7px;
+      background: rgba(0, 0, 0, .3);
+      color: #fff;
+      font-size: .8rem;
+    }
     .composer { display: flex; gap: 10px; margin-top: 16px; }
     .composer input { flex: 1; min-width: 0; }
     .composer button { width: auto; padding-inline: 20px; background: #7c5cff; color: white; }
+    .composer .attach { padding-inline: 14px; background: #2a2c36; }
   </style>
 </head>
 <body>
@@ -175,6 +185,8 @@
             autocomplete="off"
             required
           >
+          <input id="file-input" type="file" hidden>
+          <button id="attach-button" type="button" class="attach" title="Прикрепить файл">📎</button>
           <button type="submit">Отправить</button>
         </form>
       </section>
@@ -202,7 +214,10 @@
     let wsReconnectTimer = null;
     let heartbeatTimer = null;
     let membersMap = new Map();
+    let lastFileID = 0;
     const membersLine = document.getElementById('room-members');
+    const fileInput = document.getElementById('file-input');
+    const attachButton = document.getElementById('attach-button');
 
     
     let clientID = localStorage.getItem('rumics-uid');
@@ -403,6 +418,31 @@
       return new TextDecoder().decode(plaintext);
     }
 
+    async function encryptFile(file) {
+      const key = await importMessageKey();
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const buffer = await file.arrayBuffer();
+      const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv },
+        key,
+        buffer
+      ));
+      const headerPlain = new TextEncoder().encode(JSON.stringify({
+        v: 2,
+        uid: clientID,
+        name: file.name,
+        mime: file.type || 'application/octet-stream',
+        size: file.size
+      }));
+      const hiv = crypto.getRandomValues(new Uint8Array(12));
+      const header = new Uint8Array(await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv: hiv },
+        key,
+        headerPlain
+      ));
+      return { ciphertext, iv, header, hiv };
+    }
+
     function parsePayload(plaintext) {
       try {
         const data = JSON.parse(plaintext);
@@ -479,6 +519,222 @@
       lastMessageID = Math.max(lastMessageID, Number(message.id));
     }
 
+    function formatSize(bytes) {
+      if (!Number.isFinite(bytes) || bytes < 0) {
+        return '';
+      }
+      if (bytes >= 1024 * 1024) {
+        return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+      }
+      if (bytes >= 1024) {
+        return `${Math.round(bytes / 1024)} KB`;
+      }
+      return `${bytes} Б`;
+    }
+
+    async function downloadFile(meta, mime, name) {
+      try {
+        const response = await fetch(`/file?id=${meta.id}`);
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const key = await importMessageKey();
+        const ciphertext = new Uint8Array(await response.arrayBuffer());
+        const plaintext = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: base64ToBytes(meta.iv) },
+          key,
+          ciphertext
+        );
+        const url = URL.createObjectURL(new Blob([plaintext], { type: mime }));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = name;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+      } catch (error) {
+        console.error('Не удалось скачать файл', error);
+        alert('Не удалось скачать или расшифровать файл');
+      }
+    }
+
+    function appendFileBubble(header, meta, nick) {
+      if (messagesElement.dataset.empty !== 'false') {
+        messagesElement.textContent = '';
+        messagesElement.dataset.empty = 'false';
+      }
+      const nearBottom =
+        messagesElement.scrollHeight - messagesElement.scrollTop - messagesElement.clientHeight < 80;
+      const messageElement = document.createElement('div');
+      messageElement.classList.add('message');
+      if (header.own) {
+        messageElement.classList.add('own');
+      }
+      if (nick) {
+        const nickElement = document.createElement('div');
+        nickElement.className = 'message-nick';
+        nickElement.textContent = nick;
+        messageElement.appendChild(nickElement);
+      }
+      const bubbleElement = document.createElement('div');
+      bubbleElement.className = 'bubble';
+      const nameElement = document.createElement('div');
+      nameElement.className = 'file-name';
+      nameElement.textContent = header.name;
+      const sizeElement = document.createElement('div');
+      sizeElement.className = 'file-size';
+      sizeElement.textContent = formatSize(header.size);
+      const downloadElement = document.createElement('button');
+      downloadElement.type = 'button';
+      downloadElement.className = 'file-download';
+      downloadElement.textContent = 'Скачать';
+      downloadElement.addEventListener('click', () => downloadFile(meta, header.mime, header.name));
+      bubbleElement.append(nameElement, sizeElement, downloadElement);
+      const timeElement = document.createElement('div');
+      timeElement.className = 'message-time';
+      timeElement.textContent = formatTime(meta.created_at);
+      messageElement.append(bubbleElement, timeElement);
+      messagesElement.appendChild(messageElement);
+      if (nearBottom) {
+        messagesElement.scrollTop = messagesElement.scrollHeight;
+      }
+    }
+
+    async function renderFile(meta) {
+      if (Number(meta.id) <= lastFileID) {
+        return;
+      }
+      try {
+        const header = JSON.parse(await decryptMessage(
+          base64ToBytes(meta.header),
+          base64ToBytes(meta.header_iv)
+        ));
+        if (!header || header.v !== 2 || typeof header.name !== 'string') {
+          throw new Error('bad file header');
+        }
+        const own = header.uid === clientID;
+        appendFileBubble({ ...header, own }, meta, own ? '' : await nickOf(header.uid));
+      } catch (error) {
+        appendMessage('[повреждённый файл]', formatTime(meta.created_at), 'system');
+      }
+      lastFileID = Math.max(lastFileID, Number(meta.id));
+    }
+
+    async function pollFiles() {
+      if (!window.roomID || !window.roomKey) {
+        return;
+      }
+      try {
+        const params = new URLSearchParams({
+          room_id: window.roomID,
+          after_id: String(lastFileID)
+        });
+        const response = await fetch(`/files?${params}`);
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const files = await response.json();
+        for (const meta of files) {
+          await renderFile(meta);
+        }
+      } catch (error) {
+        console.error('Не удалось получить файлы', error);
+      }
+    }
+
+    async function sendFile(file) {
+      if (!file || !window.roomID || !window.roomKey) {
+        return;
+      }
+      if (file.size > 10 * 1024 * 1024) {
+        alert('Файл больше 10 MB');
+        return;
+      }
+      try {
+        const encrypted = await encryptFile(file);
+        const params = new URLSearchParams({
+          room_id: window.roomID,
+          iv: bytesToBase64(encrypted.iv),
+          hiv: bytesToBase64(encrypted.hiv),
+          header: bytesToBase64(encrypted.header)
+        });
+        const response = await fetch(`/files?${params}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: encrypted.ciphertext
+        });
+        if (response.status === 401) {
+          alert('Сессия истекла, перезагрузи страницу и подключись заново');
+          return;
+        }
+        if (response.status === 413) {
+          alert('Файл слишком большой');
+          return;
+        }
+        if (response.status === 403) {
+          alert('Комната не найдена или истекла');
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        pollFiles();
+      } catch (error) {
+        console.error('Не удалось отправить файл', error);
+        alert('Не удалось отправить файл');
+      }
+    }
+
+    attachButton.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length > 0) {
+        sendFile(fileInput.files[0]);
+      }
+      fileInput.value = '';
+    });
+
+    async function loadHistory() {
+      if (!window.roomID || !window.roomKey || pollingInProgress) {
+        return;
+      }
+      pollingInProgress = true;
+      try {
+        const messageParams = new URLSearchParams({ room_id: window.roomID, after_id: '0' });
+        const fileParams = new URLSearchParams({ room_id: window.roomID, after_id: '0' });
+        const [messagesResponse, filesResponse] = await Promise.all([
+          fetch(`/messages?${messageParams}`),
+          fetch(`/files?${fileParams}`)
+        ]);
+        if (messagesResponse.status === 401 || filesResponse.status === 401) {
+          if (pollingTimer !== null) {
+            clearInterval(pollingTimer);
+            pollingTimer = null;
+          }
+          alert('Сессия истекла, перезагрузи страницу и подключись заново');
+          return;
+        }
+        if (!messagesResponse.ok || !filesResponse.ok) {
+          throw new Error('history fetch failed');
+        }
+        const messages = await messagesResponse.json();
+        const files = await filesResponse.json();
+        const merged = [
+          ...messages.map((item) => ({ kind: 'message', at: new Date(item.created_at).getTime() || 0, data: item })),
+          ...files.map((item) => ({ kind: 'file', at: new Date(item.created_at).getTime() || 0, data: item }))
+        ].sort((a, b) => a.at - b.at);
+        for (const item of merged) {
+          if (item.kind === 'message') {
+            await renderIncoming(item.data);
+          } else {
+            await renderFile(item.data);
+          }
+        }
+      } catch (error) {
+        console.error('Не удалось загрузить историю', error);
+      } finally {
+        pollingInProgress = false;
+      }
+    }
+
     async function pollMessages() {
       if (!window.roomID || !window.roomKey || pollingInProgress || wsConnected) {
         return;
@@ -505,6 +761,7 @@
         for (const message of messages) {
           await renderIncoming(message);
         }
+        await pollFiles();
       } catch (error) {
         console.error('Не удалось получить сообщения', error);
       } finally {
@@ -529,6 +786,9 @@
         }
         if (envelope.type === 'message') {
           renderIncoming(envelope);
+        }
+        if (envelope.type === 'file') {
+          renderFile(envelope);
         }
         if (envelope.type === 'presence') {
           applyMembers(envelope.members);
@@ -591,13 +851,14 @@
       wsReconnectDelay = 1000;
       membersMap = new Map();
       membersLine.hidden = true;
+      lastFileID = 0;
       homeView.hidden = true;
       roomView.hidden = false;
       pollingTimer = setInterval(pollMessages, 1500);
       heartbeatTimer = setInterval(() => {
         joinRoom(roomID, '').catch((error) => console.error('join heartbeat failed', error));
       }, 60000);
-      pollMessages();
+      loadHistory();
       connectWS(roomID);
     }
 
