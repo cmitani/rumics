@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -29,11 +30,21 @@ var mainTemplatePath = "index.html"
 
 const sessionCookieName = "rumics_session"
 
+const maxFileCiphertext int64 = 10 << 20
+
 type messageResponse struct {
 	ID         int64     `json:"id"`
 	Ciphertext []byte    `json:"ciphertext"`
 	IV         []byte    `json:"iv"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+type fileMeta struct {
+	ID        int64     `json:"id"`
+	Header    []byte    `json:"header"`
+	HeaderIV  []byte    `json:"header_iv"`
+	IV        []byte    `json:"iv"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type session struct {
@@ -725,6 +736,171 @@ func listMessages(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ct
 	}
 }
 
+func filesHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore, h *hub) {
+	if r.Method == http.MethodPost {
+		storeFile(w, r, pool, ctx, sessions, h)
+		return
+	}
+	if r.Method == http.MethodGet {
+		listFiles(w, r, pool, ctx, sessions)
+		return
+	}
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+}
+
+func storeFile(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore, h *hub) {
+	roomID := strings.TrimSpace(r.URL.Query().Get("room_id"))
+	iv, ivErr := base64.StdEncoding.DecodeString(r.URL.Query().Get("iv"))
+	hiv, hivErr := base64.StdEncoding.DecodeString(r.URL.Query().Get("hiv"))
+	header, headerErr := base64.StdEncoding.DecodeString(r.URL.Query().Get("header"))
+	if roomID == "" || ivErr != nil || hivErr != nil || headerErr != nil ||
+		len(iv) == 0 || len(hiv) == 0 || len(header) == 0 {
+		http.Error(w, "room ID, iv, hiv and header are required", http.StatusBadRequest)
+		return
+	}
+	if !requireSession(r, roomID, sessions) {
+		http.Error(w, "нет активной сессии для комнаты", http.StatusUnauthorized)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxFileCiphertext)
+	ciphertext, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "файл слишком большой", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if len(ciphertext) == 0 {
+		http.Error(w, "пустой файл", http.StatusBadRequest)
+		return
+	}
+
+	const storeFileQuery = `
+		WITH bumped AS (
+			UPDATE rooms
+			SET last_activity = now()
+			WHERE id = $1 AND expire > now()
+			RETURNING 1
+		)
+		INSERT INTO files (room_id, header, header_iv, ciphertext, iv)
+		SELECT $1, $2, $3, $4, $5 FROM bumped
+		RETURNING id, created_at
+	`
+	var fileID int64
+	var createdAt time.Time
+	err = pool.QueryRow(ctx, storeFileQuery, roomID, header, hiv, ciphertext, iv).Scan(&fileID, &createdAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		http.Error(w, "комната не найдена или истекла", http.StatusForbidden)
+		return
+	}
+	if err != nil {
+		log.Print(err)
+		http.Error(w, "не удалось сохранить файл", http.StatusInternalServerError)
+		return
+	}
+
+	broadcastPayload, err := json.Marshal(map[string]any{
+		"type":       "file",
+		"id":         fileID,
+		"header":     header,
+		"header_iv":  hiv,
+		"iv":         iv,
+		"created_at": createdAt,
+	})
+	if err == nil {
+		h.broadcast(roomID, broadcastPayload)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]any{
+		"id":         fileID,
+		"created_at": createdAt,
+	}); err != nil {
+		log.Print(err)
+	}
+}
+
+func listFiles(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore) {
+	roomID := strings.TrimSpace(r.URL.Query().Get("room_id"))
+	if roomID == "" {
+		http.Error(w, "room ID is required", http.StatusBadRequest)
+		return
+	}
+	if !requireSession(r, roomID, sessions) {
+		http.Error(w, "нет активной сессии для комнаты", http.StatusUnauthorized)
+		return
+	}
+
+	afterID := int64(0)
+	if value := r.URL.Query().Get("after_id"); value != "" {
+		parsedID, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || parsedID < 0 {
+			http.Error(w, "invalid after_id", http.StatusBadRequest)
+			return
+		}
+		afterID = parsedID
+	}
+
+	rows, err := pool.Query(ctx,
+		"SELECT id, header, header_iv, iv, created_at FROM files WHERE room_id = $1 AND id > $2 ORDER BY id ASC LIMIT 100",
+		roomID, afterID,
+	)
+	if err != nil {
+		log.Print(err)
+		http.Error(w, "не удалось получить файлы", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	files := make([]fileMeta, 0)
+	for rows.Next() {
+		var file fileMeta
+		if err := rows.Scan(&file.ID, &file.Header, &file.HeaderIV, &file.IV, &file.CreatedAt); err != nil {
+			log.Print(err)
+			http.Error(w, "не удалось прочитать файл", http.StatusInternalServerError)
+			return
+		}
+		files = append(files, file)
+	}
+	if err := rows.Err(); err != nil {
+		log.Print(err)
+		http.Error(w, "не удалось прочитать файлы", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(files); err != nil {
+		log.Print(err)
+	}
+}
+
+func fileHandler(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, ctx context.Context, sessions *sessionStore) {
+	fileID, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("id")), 10, 64)
+	if err != nil || fileID <= 0 {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+
+	var roomID string
+	var ciphertext []byte
+	err = pool.QueryRow(ctx,
+		"SELECT room_id, ciphertext FROM files WHERE id = $1",
+		fileID,
+	).Scan(&roomID, &ciphertext)
+	if err != nil {
+		http.Error(w, "файл не найден", http.StatusNotFound)
+		return
+	}
+	if !requireSession(r, roomID, sessions) {
+		http.Error(w, "нет активной сессии для комнаты", http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(len(ciphertext)))
+	if _, err := w.Write(ciphertext); err != nil {
+		log.Print(err)
+	}
+}
+
 func checker(pool *pgxpool.Pool, ctx context.Context, h *hub) {
 
 	ticker := time.NewTicker(5 * time.Minute)
@@ -818,6 +994,12 @@ func main() {
 	http.HandleFunc("/ws", wsHandler(messageHub, sessions))
 	http.HandleFunc("/join", func(w http.ResponseWriter, r *http.Request) {
 		joinHandler(w, r, pool, ctx, sessions, messageHub)
+	})
+	http.HandleFunc("/files", func(w http.ResponseWriter, r *http.Request) {
+		filesHandler(w, r, pool, ctx, sessions, messageHub)
+	})
+	http.HandleFunc("/file", func(w http.ResponseWriter, r *http.Request) {
+		fileHandler(w, r, pool, ctx, sessions)
 	})
 	http.HandleFunc("/messages", func(w http.ResponseWriter, r *http.Request) {
 		messagesHandler(w, r, pool, ctx, sessions, messageHub)
