@@ -1,0 +1,14 @@
+{
+	order rate_limit before basicauth
+}
+
+rumics.test.com {
+	rate_limit {
+		zone dynamic {
+			key {remote_host}
+			events 100
+			window 1m
+		}
+	}
+	reverse_proxy localhost:8080
+}
