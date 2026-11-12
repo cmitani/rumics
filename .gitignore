@@ -7,8 +7,6 @@
 .vscode/
 scripts/dumps/
 scripts/logs/
-.idea/
-.vscode/
 .mimosa
-
-
+__pycache__/
+.pytest_cache/
